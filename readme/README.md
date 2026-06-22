@@ -6,10 +6,10 @@
 
 ```
 作業フォルダ/
-├── 商品価格管理.db               ← SQLiteデータベース（初回実行で自動生成）
+├── price_db.db                   ← SQLiteデータベース（初回実行で自動生成）
 ├── sqlite_price_lookup.py        ← 価格検索本体（VBAから呼ばれる）
 ├── db_import.py                  ← CSVをDBに取込むスクリプト
-├── DB取込.bat                    ← ダブルクリックで取込実行
+├── run_import.bat                ← ダブルクリックで取込実行
 ├── 使い方.md
 └── csv/                          ← CSVを置くフォルダ
     ├── 標準DB.csv
@@ -22,7 +22,7 @@
 ## 初回セットアップ
 
 1. `csv/` フォルダにCSVを入れる
-2. `DB取込.bat` をダブルクリック
+2. `run_import.bat` をダブルクリック
 3. VBAモジュール（.bas）をExcelにインポート
 
 以上で完了。
@@ -36,26 +36,27 @@
 3. マクロ `RunPriceLookupViaPython` を実行
 4. 候補が複数ある場合はポップアップが出るので番号または品番CDを入力
 
-**結果はC〜F列に入る**
+**結果はC〜G列に入る**
 
 | 列 | 内容 |
 |----|------|
 | C  | 価格 |
-| D  | 結果メモ（参照DB・品番CD等） |
-| E  | 品番CD |
-| F  | 正式材料名 |
+| D  | 荷姿 / 単位 |
+| E  | 結果メモ（参照DB・品番CD・類似度等） |
+| F  | 品番CD |
+| G  | 正式材料名 |
 
 ---
 
 ## データを更新したいとき
 
 1. `csv/` フォルダ内の該当CSVを直接編集
-2. `DB取込.bat` をダブルクリック
+2. `run_import.bat` をダブルクリック
 
 特定のソースだけ更新したい場合はコマンドで実行:
 
 ```
-python db_import.py --db 商品価格管理.db --csvdir csv --source 標準DB
+python db_import.py --db price_db.db --csvdir csv --source 標準DB
 ```
 
 ---
@@ -63,7 +64,7 @@ python db_import.py --db 商品価格管理.db --csvdir csv --source 標準DB
 ## 新しいDBを追加したいとき
 
 1. `csv/` フォルダに `○○社DB.csv` を置く
-2. `DB取込.bat` をダブルクリック
+2. `run_import.bat` をダブルクリック
 3. Excelの B2セルに `○○社DB` と入力して使える
 
 スクリプトの変更は不要。
