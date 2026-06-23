@@ -260,6 +260,10 @@ def load_area_settings(conn: sqlite3.Connection, csv_path: Path) -> int:
                 continue
             t1 = parse_area(row.get(col_t1, "")) if col_t1 else None
             t2 = parse_area(row.get(col_t2, "")) if col_t2 else None
+            # 設定ミス検知: 特価2の面積が特価1の面積以下だと段階が逆転し誤った価格になる
+            if t1 is not None and t2 is not None and t2 <= t1:
+                print(f"  [面積設定] 警告: {db} の特価2面積({t2:g})が特価1面積({t1:g})以下です。"
+                      f"特価1<特価2 の順に設定してください。")
             settings.append((db, t1, t2))
 
     with conn:
@@ -298,9 +302,13 @@ def main() -> int:
         raise SystemExit(f"CSVファイルが見つかりません: {csv_dir}")
 
     if args.source:
-        csv_files = [f for f in csv_files if f.stem == args.source]
-        if not csv_files:
+        # 面積設定ファイルは価格表ではないので --source 指定時も常に処理する
+        # （閾値の編集が特定ソース取込でも反映されるように）
+        target = [f for f in csv_files if f.stem == args.source]
+        if not target:
             raise SystemExit(f"指定ソースのCSVが見つかりません: {args.source}")
+        settings = [f for f in csv_files if f.stem in SETTINGS_STEMS and f not in target]
+        csv_files = target + settings
 
     conn = sqlite3.connect(db_path)
     try:
