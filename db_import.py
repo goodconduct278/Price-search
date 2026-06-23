@@ -146,7 +146,7 @@ def ensure_tables(conn: sqlite3.Connection):
         );
     """)
     # 既存DBに列がなければ追加（後方互換マイグレーション）
-    for col in ("note", "price_tier1", "price_tier2"):
+    for col in ("unit", "note", "price_tier1", "price_tier2"):
         try:
             conn.execute(f"ALTER TABLE product_prices ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:

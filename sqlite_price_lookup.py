@@ -34,7 +34,7 @@ FIELD_SEP = "|||FLD|||"
 
 # DBの能力（列・テーブルの有無）。main() で1回だけ判定して使い回す。
 # 旧DB（面積対応前にインポートされたDB）でも落ちないようにするため。
-CAPS = {"tier_cols": False, "threshold_tbl": False}
+CAPS = {"tier_cols": False, "threshold_tbl": False, "unit_col": False}
 # source_db -> (tier1_area, tier2_area) のキャッシュ
 _THRESHOLD_CACHE: dict = {}
 
@@ -56,9 +56,10 @@ def parse_area(value) -> float | None:
 
 
 def detect_caps(conn: sqlite3.Connection) -> None:
-    """product_prices に特価列があるか、area_thresholds テーブルがあるかを判定"""
+    """product_prices に特価列・unit列があるか、area_thresholds テーブルがあるかを判定"""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(product_prices)")}
     CAPS["tier_cols"] = "price_tier1" in cols and "price_tier2" in cols
+    CAPS["unit_col"] = "unit" in cols
     tbl = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='area_thresholds'"
     ).fetchone()
@@ -243,10 +244,15 @@ def find_similar_candidates(conn: sqlite3.Connection, product_name: str, limit: 
 
 def get_price_for_source(conn: sqlite3.Connection, product_cd: str, source_db: str):
     # 変更: unit / 特価1 / 特価2 を SELECT に追加（特価列は無いDBでも動くよう分岐）
+    if CAPS["unit_col"]:
+        unit_expr = "COALESCE(unit, '') AS unit"
+    else:
+        unit_expr = "'' AS unit"
+
     if CAPS["tier_cols"]:
-        sql = """
+        sql = f"""
         SELECT product_cd, material_name, source_db, price,
-               COALESCE(unit, '') AS unit,
+               {unit_expr},
                COALESCE(note, '') AS note,
                COALESCE(price_tier1, '') AS price_tier1,
                COALESCE(price_tier2, '') AS price_tier2
@@ -255,9 +261,9 @@ def get_price_for_source(conn: sqlite3.Connection, product_cd: str, source_db: s
         ORDER BY id LIMIT 1
         """
     else:
-        sql = """
+        sql = f"""
         SELECT product_cd, material_name, source_db, price,
-               COALESCE(unit, '') AS unit,
+               {unit_expr},
                COALESCE(note, '') AS note,
                '' AS price_tier1,
                '' AS price_tier2
