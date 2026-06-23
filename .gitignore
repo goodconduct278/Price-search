@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+price_db.db
+_price_lookup_error.log

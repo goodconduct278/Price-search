@@ -17,10 +17,13 @@ SQLite価格検索 Python側スクリプト
 - write_output_tsv: ヘッダーに unit を追加（official_name と candidates の間）
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sqlite3
 import sys
+import traceback
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -28,6 +31,72 @@ from pathlib import Path
 
 REC_SEP = "|||REC|||"
 FIELD_SEP = "|||FLD|||"
+
+# DBの能力（列・テーブルの有無）。main() で1回だけ判定して使い回す。
+# 旧DB（面積対応前にインポートされたDB）でも落ちないようにするため。
+CAPS = {"tier_cols": False, "threshold_tbl": False}
+# source_db -> (tier1_area, tier2_area) のキャッシュ
+_THRESHOLD_CACHE: dict = {}
+
+
+def parse_area(value) -> float | None:
+    """'301㎡' / '301 m2' / '1,200' などを数値(㎡)に変換する。空・不正は None"""
+    if value is None:
+        return None
+    s = str(value).replace("﻿", "").strip()
+    if not s:
+        return None
+    s = unicodedata.normalize("NFKC", s)
+    for token in ("㎡", "m2", "M2", "平米", "平方メートル", ",", " "):
+        s = s.replace(token, "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def detect_caps(conn: sqlite3.Connection) -> None:
+    """product_prices に特価列があるか、area_thresholds テーブルがあるかを判定"""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(product_prices)")}
+    CAPS["tier_cols"] = "price_tier1" in cols and "price_tier2" in cols
+    tbl = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='area_thresholds'"
+    ).fetchone()
+    CAPS["threshold_tbl"] = tbl is not None
+
+
+def get_area_thresholds(conn: sqlite3.Connection, source_db: str):
+    """指定ソースの (tier1_area, tier2_area) を返す。未設定なら (None, None)"""
+    if not CAPS["threshold_tbl"]:
+        return (None, None)
+    if source_db in _THRESHOLD_CACHE:
+        return _THRESHOLD_CACHE[source_db]
+    row = conn.execute(
+        "SELECT tier1_area, tier2_area FROM area_thresholds WHERE source_db = ?",
+        (source_db,)
+    ).fetchone()
+    result = (row[0], row[1]) if row is not None else (None, None)
+    _THRESHOLD_CACHE[source_db] = result
+    return result
+
+
+def resolve_tier_price(base, tier1, tier2, area, t1_area, t2_area):
+    """面積に応じて適用価格とラベルを返す。
+    仕様: 面積<t1_area=通常 / t1_area以上=特価1 / t2_area以上=特価2
+    ラベル "" は面積処理なし（閾値未設定 or 面積未入力）を意味する。"""
+    base = "" if base is None else str(base).strip()
+    tier1 = "" if tier1 is None else str(tier1).strip()
+    tier2 = "" if tier2 is None else str(tier2).strip()
+
+    # 面積未入力、またはこのDBに閾値設定なし → 通常価格（面積処理なし）
+    if area is None or (t1_area is None and t2_area is None):
+        return base, ""
+
+    if t2_area is not None and area >= t2_area and tier2 != "":
+        return tier2, "特価2"
+    if t1_area is not None and area >= t1_area and tier1 != "":
+        return tier1, "特価1"
+    return base, "通常"
 
 
 def get_valid_sources(conn: sqlite3.Connection) -> list[str]:
@@ -173,17 +242,29 @@ def find_similar_candidates(conn: sqlite3.Connection, product_name: str, limit: 
 
 
 def get_price_for_source(conn: sqlite3.Connection, product_cd: str, source_db: str):
-    # 変更: unit を SELECT に追加
-    sql = """
-    SELECT product_cd, material_name, source_db, price,
-           COALESCE(unit, '') AS unit,
-           COALESCE(note, '') AS note
-    FROM product_prices
-    WHERE product_cd = ?
-      AND source_db = ?
-    ORDER BY id
-    LIMIT 1
-    """
+    # 変更: unit / 特価1 / 特価2 を SELECT に追加（特価列は無いDBでも動くよう分岐）
+    if CAPS["tier_cols"]:
+        sql = """
+        SELECT product_cd, material_name, source_db, price,
+               COALESCE(unit, '') AS unit,
+               COALESCE(note, '') AS note,
+               COALESCE(price_tier1, '') AS price_tier1,
+               COALESCE(price_tier2, '') AS price_tier2
+        FROM product_prices
+        WHERE product_cd = ? AND source_db = ?
+        ORDER BY id LIMIT 1
+        """
+    else:
+        sql = """
+        SELECT product_cd, material_name, source_db, price,
+               COALESCE(unit, '') AS unit,
+               COALESCE(note, '') AS note,
+               '' AS price_tier1,
+               '' AS price_tier2
+        FROM product_prices
+        WHERE product_cd = ? AND source_db = ?
+        ORDER BY id LIMIT 1
+        """
 
     row = conn.execute(sql, (product_cd, source_db)).fetchone()
     if row is None:
@@ -196,10 +277,12 @@ def get_price_for_source(conn: sqlite3.Connection, product_cd: str, source_db: s
         "price": "" if row[3] is None else str(row[3]).strip(),
         "unit": "" if row[4] is None else str(row[4]).strip(),
         "note": "" if row[5] is None else str(row[5]).strip(),
+        "price_tier1": "" if row[6] is None else str(row[6]).strip(),
+        "price_tier2": "" if row[7] is None else str(row[7]).strip(),
     }
 
 
-def get_best_price(conn: sqlite3.Connection, product_cd: str, primary_source: str):
+def get_best_price(conn: sqlite3.Connection, product_cd: str, primary_source: str, area: float | None = None):
     blank_sources = []
     blank_unit = ""  # 価格未入力でも荷姿だけは拾えたら返す
 
@@ -209,18 +292,26 @@ def get_best_price(conn: sqlite3.Connection, product_cd: str, primary_source: st
         if hit is None:
             continue
 
-        if hit["price"] == "":
+        # 面積に応じて適用価格を決定（閾値未設定/面積未入力なら通常価格）
+        t1_area, t2_area = get_area_thresholds(conn, source_db)
+        price_value, tier_label = resolve_tier_price(
+            hit["price"], hit["price_tier1"], hit["price_tier2"],
+            area, t1_area, t2_area
+        )
+
+        if price_value == "":
             blank_sources.append(source_db)
             if blank_unit == "":
                 blank_unit = hit["unit"]
             continue
 
         return {
-            "price_result": hit["price"],
+            "price_result": price_value,
             "used_source": source_db,
             "price_status": "ok",
             "unit": hit["unit"],
             "note": hit["note"],
+            "tier": tier_label,
         }
 
     if blank_sources:
@@ -230,6 +321,7 @@ def get_best_price(conn: sqlite3.Connection, product_cd: str, primary_source: st
             "price_status": "blank",
             "unit": blank_unit,
             "note": "",
+            "tier": "",
         }
 
     return {
@@ -238,14 +330,15 @@ def get_best_price(conn: sqlite3.Connection, product_cd: str, primary_source: st
         "price_status": "missing",
         "unit": "",
         "note": "",
+        "tier": "",
     }
 
 
-def enrich_candidates_with_price(conn: sqlite3.Connection, candidates: list[dict], primary_source: str):
+def enrich_candidates_with_price(conn: sqlite3.Connection, candidates: list[dict], primary_source: str, area: float | None = None):
     enriched = []
 
     for i, c in enumerate(candidates, start=1):
-        price_info = get_best_price(conn, c["product_cd"], primary_source)
+        price_info = get_best_price(conn, c["product_cd"], primary_source, area)
 
         enriched.append({
             "no": str(i),
@@ -290,19 +383,35 @@ def pack_candidates(candidates: list[dict]) -> str:
     return REC_SEP.join(records)
 
 
-def auto_result_from_cd(conn: sqlite3.Connection, primary_source: str, product_cd: str, official_name: str, match_score: float | None = None):
+def tier_memo(tier_label: str, area: float | None) -> str:
+    """適用された面積区分をメモ用文字列にする（通常/面積処理なしは空）"""
+    if tier_label in ("特価1", "特価2"):
+        area_txt = "" if area is None else f"・面積{format_area(area)}㎡"
+        return f" / {tier_label}適用{area_txt}"
+    return ""
+
+
+def format_area(area: float) -> str:
+    """301.0 -> '301' のように見やすく整形"""
+    if area == int(area):
+        return str(int(area))
+    return str(area)
+
+
+def auto_result_from_cd(conn: sqlite3.Connection, primary_source: str, product_cd: str, official_name: str, match_score: float | None = None, area: float | None = None):
     # match_score を渡すと「類似一致を自動確定した」旨をメモに明示する（完全一致では None）
     sim_note = ""
     if match_score is not None and match_score < 1.0:
         sim_note = f" / 類似度:{round(match_score * 100)}%（自動確定）"
 
-    price_info = get_best_price(conn, product_cd, primary_source)
+    price_info = get_best_price(conn, product_cd, primary_source, area)
 
     if price_info["price_status"] == "ok":
+        tnote = tier_memo(price_info.get("tier", ""), area)
         if price_info["used_source"] == primary_source:
-            memo = f"OK / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}{sim_note}"
+            memo = f"OK / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}{tnote}{sim_note}"
         else:
-            memo = f"代替参照 / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}{sim_note}"
+            memo = f"代替参照 / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}{tnote}{sim_note}"
 
         return {
             "price_result": price_info["price_result"],
@@ -323,8 +432,8 @@ def auto_result_from_cd(conn: sqlite3.Connection, primary_source: str, product_c
     }
 
 
-def selection_result(conn: sqlite3.Connection, primary_source: str, candidates: list[dict], memo: str):
-    enriched = enrich_candidates_with_price(conn, candidates, primary_source)
+def selection_result(conn: sqlite3.Connection, primary_source: str, candidates: list[dict], memo: str, area: float | None = None):
+    enriched = enrich_candidates_with_price(conn, candidates, primary_source, area)
 
     return {
         "price_result": "候補選択",
@@ -349,7 +458,7 @@ def get_candidates_in_source(conn: sqlite3.Connection, candidates: list[dict], s
     return result
 
 
-def lookup_one(conn: sqlite3.Connection, primary_source: str, product_name: str):
+def lookup_one(conn: sqlite3.Connection, primary_source: str, product_name: str, area: float | None = None):
     exact = find_exact_candidates(conn, product_name)
 
     if len(exact) > 0:
@@ -359,13 +468,13 @@ def lookup_one(conn: sqlite3.Connection, primary_source: str, product_name: str)
         for source in make_source_order(primary_source):
             in_source = get_candidates_in_source(conn, exact, source)
             if len(in_source) == 1:
-                return auto_result_from_cd(conn, primary_source, in_source[0]["product_cd"], in_source[0]["official_name"])
+                return auto_result_from_cd(conn, primary_source, in_source[0]["product_cd"], in_source[0]["official_name"], area=area)
             elif len(in_source) >= 2:
-                return selection_result(conn, primary_source, in_source, "同じDBに複数の候補があります。候補から選んでください。")
+                return selection_result(conn, primary_source, in_source, "同じDBに複数の候補があります。候補から選んでください。", area)
 
         # どのDBにも価格エントリがない場合
         c = exact[0]
-        return auto_result_from_cd(conn, primary_source, c["product_cd"], c["official_name"])
+        return auto_result_from_cd(conn, primary_source, c["product_cd"], c["official_name"], area=area)
 
     # 完全一致なし → 類似候補（選択DBで絞り込む）
     similar = find_similar_candidates(conn, product_name)
@@ -389,10 +498,10 @@ def lookup_one(conn: sqlite3.Connection, primary_source: str, product_name: str)
         if len(in_source) == 1:
             c = in_source[0]
             if c["score"] >= AUTO_SIMILAR_THRESHOLD:
-                return auto_result_from_cd(conn, primary_source, c["product_cd"], c["official_name"], match_score=c["score"])
-            return selection_result(conn, primary_source, in_source, "似た候補が1件あります。内容を確認して選んでください。")
+                return auto_result_from_cd(conn, primary_source, c["product_cd"], c["official_name"], match_score=c["score"], area=area)
+            return selection_result(conn, primary_source, in_source, "似た候補が1件あります。内容を確認して選んでください。", area)
         elif len(in_source) >= 2:
-            return selection_result(conn, primary_source, in_source, "似た候補があります。候補から選んでください。")
+            return selection_result(conn, primary_source, in_source, "似た候補があります。候補から選んでください。", area)
 
     return {
         "price_result": "未登録",
@@ -420,12 +529,14 @@ def main() -> int:
     parser.add_argument("--source", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--area", default="", help="面積(㎡)。空なら面積処理なし")
     args = parser.parse_args()
 
     db_path = Path(args.db)
     input_path = Path(args.input)
     output_path = Path(args.output)
     source_db = clean_text(args.source)
+    area = parse_area(args.area)
 
     # source_db の妥当性チェックは DB オープン後に実施
 
@@ -440,6 +551,7 @@ def main() -> int:
 
     conn = sqlite3.connect(db_path)
     try:
+        detect_caps(conn)
         valid_sources = get_valid_sources(conn)
         if valid_sources and source_db not in valid_sources:
             raise SystemExit(
@@ -460,7 +572,7 @@ def main() -> int:
                     "candidates": "",
                 }
             else:
-                result = lookup_one(conn, source_db, product_name)
+                result = lookup_one(conn, source_db, product_name, area)
 
             output_rows.append({
                 "row_no": row["row_no"],
@@ -474,9 +586,30 @@ def main() -> int:
     return 0
 
 
+def _write_error_log(message: str) -> None:
+    """VBAは非表示ウィンドウでPythonを実行するためstderrが見えない。
+    スクリプトと同じフォルダにログを残し、原因を追えるようにする。"""
+    try:
+        log_path = Path(__file__).with_name("_price_lookup_error.log")
+        with log_path.open("w", encoding="utf-8-sig") as f:
+            f.write(message)
+    except Exception:
+        # ログ書き出し自体が失敗しても本来のエラーを優先する
+        pass
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    except SystemExit as e:
+        # main() の正常終了(0)はそのまま。異常系メッセージはログにも残す
+        if e.code not in (0, None):
+            detail = str(e.code)
+            print(f"ERROR: {detail}", file=sys.stderr)
+            _write_error_log(detail)
+        raise
+    except Exception:
+        detail = traceback.format_exc()
+        print(detail, file=sys.stderr)
+        _write_error_log(detail)
         raise SystemExit(1)
