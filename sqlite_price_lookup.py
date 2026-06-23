@@ -17,10 +17,13 @@ SQLite価格検索 Python側スクリプト
 - write_output_tsv: ヘッダーに unit を追加（official_name と candidates の間）
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sqlite3
 import sys
+import traceback
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -474,9 +477,30 @@ def main() -> int:
     return 0
 
 
+def _write_error_log(message: str) -> None:
+    """VBAは非表示ウィンドウでPythonを実行するためstderrが見えない。
+    スクリプトと同じフォルダにログを残し、原因を追えるようにする。"""
+    try:
+        log_path = Path(__file__).with_name("_price_lookup_error.log")
+        with log_path.open("w", encoding="utf-8-sig") as f:
+            f.write(message)
+    except Exception:
+        # ログ書き出し自体が失敗しても本来のエラーを優先する
+        pass
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    except SystemExit as e:
+        # main() の正常終了(0)はそのまま。異常系メッセージはログにも残す
+        if e.code not in (0, None):
+            detail = str(e.code)
+            print(f"ERROR: {detail}", file=sys.stderr)
+            _write_error_log(detail)
+        raise
+    except Exception:
+        detail = traceback.format_exc()
+        print(detail, file=sys.stderr)
+        _write_error_log(detail)
         raise SystemExit(1)
