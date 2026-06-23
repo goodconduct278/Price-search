@@ -19,6 +19,8 @@ CSVの必須列: 品番CD（または 品番コード）、材料名（または
   python db_import.py --db 商品価格管理.db --csvdir csv --source 標準DB
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sqlite3
@@ -35,6 +37,16 @@ COL_NAME       = ["材料名", "品番名", "品名"]
 COL_PRICE      = ["価格", "単価", "仕入価格"]
 COL_NOTE       = ["備  考", "備考", "備　考"]
 COL_UNIT       = ["荷姿 / 単位", "荷姿/単位", "荷姿・単位", "荷姿／単位", "荷姿・寸法"]
+# 面積別の特価（任意列）。あれば price_tier1 / price_tier2 に取込む
+COL_TIER1      = ["特価1", "特化1", "特価①", "特価➀", "特価1価格"]
+COL_TIER2      = ["特価2", "特化2", "特価②", "特価➁", "特価2価格"]
+
+# 面積閾値の設定ファイル（csv/ に置く別ファイルで管理）
+# ファイル名（拡張子なし）がこれらのいずれかなら、価格表ではなく閾値定義として読む
+SETTINGS_STEMS    = {"面積設定", "面積閾値", "面積しきい値", "エリア設定", "area_settings"}
+COL_SETTINGS_DB   = ["DB名", "DB", "価格表", "価格表DB", "ソースDB", "source_db"]
+COL_SETTINGS_T1   = ["特価1面積", "特価1の面積", "特価①面積", "特価1", "特化1", "tier1", "tier1_area"]
+COL_SETTINGS_T2   = ["特価2面積", "特価2の面積", "特価②面積", "特価2", "特化2", "tier2", "tier2_area"]
 
 
 def find_col(headers: list[str], candidates: list[str]) -> str | None:
@@ -76,6 +88,20 @@ def normalize_cd(value: str) -> str:
         return s
 
 
+def parse_area(value) -> float | None:
+    """'301㎡' / '301 m2' / '1,200' などを数値(㎡)に変換する。空・不正は None"""
+    s = clean_text(value)
+    if not s:
+        return None
+    s = unicodedata.normalize("NFKC", s)
+    for token in ("㎡", "m2", "M2", "平米", "平方メートル", ",", " "):
+        s = s.replace(token, "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 # ──────────────────────────────────────────
 # DB操作
 # ──────────────────────────────────────────
@@ -105,16 +131,26 @@ def ensure_tables(conn: sqlite3.Connection):
             source_db     TEXT NOT NULL,
             price         TEXT,
             unit          TEXT,
-            note          TEXT
+            note          TEXT,
+            price_tier1   TEXT,
+            price_tier2   TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_prices_cd_source
             ON product_prices (product_cd, source_db);
+
+        -- 面積別特価の閾値（DB=価格表ごとに設定。未登録のDBは面積処理なし）
+        CREATE TABLE IF NOT EXISTS area_thresholds (
+            source_db  TEXT PRIMARY KEY,
+            tier1_area REAL,
+            tier2_area REAL
+        );
     """)
-    # 既存DBにnote列がなければ追加
-    try:
-        conn.execute("ALTER TABLE product_prices ADD COLUMN note TEXT")
-    except sqlite3.OperationalError:
-        pass  # すでに存在する
+    # 既存DBに列がなければ追加（後方互換マイグレーション）
+    for col in ("note", "price_tier1", "price_tier2"):
+        try:
+            conn.execute(f"ALTER TABLE product_prices ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # すでに存在する
     conn.commit()
 
 
@@ -130,6 +166,8 @@ def import_one_csv(conn: sqlite3.Connection, csv_path: Path, source_db: str) -> 
         col_price = find_col(headers, COL_PRICE)
         col_note  = find_col(headers, COL_NOTE)
         col_unit  = find_col(headers, COL_UNIT)
+        col_tier1 = find_col(headers, COL_TIER1)
+        col_tier2 = find_col(headers, COL_TIER2)
 
         if not col_cd:
             raise ValueError(f"品番CD列が見つかりません: {headers}")
@@ -147,7 +185,10 @@ def import_one_csv(conn: sqlite3.Connection, csv_path: Path, source_db: str) -> 
             price = clean_text(row.get(col_price, "")) if has_price else ""
             unit  = clean_text(row.get(col_unit, ""))  if col_unit  else ""
             note  = clean_text(row.get(col_note,  ""))  if col_note  else ""
-            rows.append({"cd": cd, "name": name, "price": price, "unit": unit, "note": note})
+            tier1 = clean_text(row.get(col_tier1, "")) if col_tier1 else ""
+            tier2 = clean_text(row.get(col_tier2, "")) if col_tier2 else ""
+            rows.append({"cd": cd, "name": name, "price": price, "unit": unit,
+                         "note": note, "tier1": tier1, "tier2": tier2})
 
     if not rows:
         print(f"  [{source_db}] {csv_path.name}: 有効行なし、スキップ")
@@ -184,15 +225,55 @@ def import_one_csv(conn: sqlite3.Connection, csv_path: Path, source_db: str) -> 
                 "DELETE FROM product_prices WHERE source_db = ?", (source_db,)
             )
             conn.executemany(
-                "INSERT INTO product_prices (product_cd, material_name, source_db, price, unit, note) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [(r["cd"], r["name"], source_db, r["price"], r["unit"], r["note"]) for r in rows]
+                "INSERT INTO product_prices "
+                "(product_cd, material_name, source_db, price, unit, note, price_tier1, price_tier2) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [(r["cd"], r["name"], source_db, r["price"], r["unit"], r["note"],
+                  r["tier1"], r["tier2"]) for r in rows]
             )
             cnt["price"] = len(rows)
 
     label = f"master:{cnt['master']} alias:{cnt['alias']} price:{cnt['price'] if has_price else 'なし（価格列なし）'}"
     print(f"  [{source_db}] {csv_path.name}: {len(rows)} 行 / {label}")
     return cnt
+
+
+def load_area_settings(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """面積閾値の設定ファイルを読み、area_thresholds に登録する。
+    形式: DB名 / 特価1面積 / 特価2面積（列名は表記ゆれ可）"""
+    settings = []
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+
+        col_db = find_col(headers, COL_SETTINGS_DB)
+        col_t1 = find_col(headers, COL_SETTINGS_T1)
+        col_t2 = find_col(headers, COL_SETTINGS_T2)
+
+        if not col_db:
+            raise ValueError(f"DB名列が見つかりません: {headers}")
+
+        for row in reader:
+            db = clean_text(row.get(col_db, ""))
+            if not db:
+                continue
+            t1 = parse_area(row.get(col_t1, "")) if col_t1 else None
+            t2 = parse_area(row.get(col_t2, "")) if col_t2 else None
+            settings.append((db, t1, t2))
+
+    with conn:
+        for db, t1, t2 in settings:
+            conn.execute("""
+                INSERT INTO area_thresholds (source_db, tier1_area, tier2_area)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source_db) DO UPDATE SET
+                    tier1_area = excluded.tier1_area,
+                    tier2_area = excluded.tier2_area
+            """, (db, t1, t2))
+
+    print(f"  [面積設定] {csv_path.name}: {len(settings)} 件のDB閾値を登録")
+    return len(settings)
 
 
 # ──────────────────────────────────────────
@@ -230,6 +311,16 @@ def main() -> int:
 
         for csv_path in csv_files:
             source_db = csv_path.stem
+
+            # 面積閾値の設定ファイルは価格表ではなく閾値定義として読む
+            if source_db in SETTINGS_STEMS:
+                try:
+                    load_area_settings(conn, csv_path)
+                except Exception as e:
+                    errors.append((source_db, str(e)))
+                    print(f"  [{source_db}] ERROR: {e}")
+                continue
+
             try:
                 cnt = import_one_csv(conn, csv_path, source_db)
                 total_rows += cnt["master"]

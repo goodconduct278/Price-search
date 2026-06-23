@@ -12,6 +12,7 @@ Sub RunPriceLookupViaPython()
     Dim inputPath As String
     Dim outputPath As String
     Dim sourceDb As String
+    Dim areaText As String
     Dim lastRow As Long
     Dim cmd As String
     Dim exitCode As Long
@@ -26,6 +27,11 @@ Sub RunPriceLookupViaPython()
     outputPath = folderPath & "\_price_lookup_output.tsv"
 
     sourceDb = Trim(CStr(ws.Range("B2").Value))
+
+    ' [面積特価対応] E2に面積(㎡)を入力する。空なら面積処理なし（通常価格）。
+    ' D2に入力ガイドのラベルを表示しておく。
+    ws.Range("D2").Value = "面積(㎡)→"
+    areaText = Trim(CStr(ws.Range("E2").Value))
 
     ' [修正②] ハードコードリスト廃止。空チェックのみ実施し、DB名の妥当性はPython側に任せる
     If sourceDb = "" Then
@@ -76,6 +82,11 @@ Sub RunPriceLookupViaPython()
           " --source " & QuotePath(sourceDb) & _
           " --input " & QuotePath(inputPath) & _
           " --output " & QuotePath(outputPath)
+
+    ' [面積特価対応] 面積が入力されていれば --area で渡す（空なら渡さない）
+    If areaText <> "" Then
+        cmd = cmd & " --area " & QuotePath(areaText)
+    End If
 
     Set shell = CreateObject("WScript.Shell")
     exitCode = shell.Run(cmd, 0, True)
