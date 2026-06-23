@@ -290,14 +290,19 @@ def pack_candidates(candidates: list[dict]) -> str:
     return REC_SEP.join(records)
 
 
-def auto_result_from_cd(conn: sqlite3.Connection, primary_source: str, product_cd: str, official_name: str):
+def auto_result_from_cd(conn: sqlite3.Connection, primary_source: str, product_cd: str, official_name: str, match_score: float | None = None):
+    # match_score を渡すと「類似一致を自動確定した」旨をメモに明示する（完全一致では None）
+    sim_note = ""
+    if match_score is not None and match_score < 1.0:
+        sim_note = f" / 類似度:{round(match_score * 100)}%（自動確定）"
+
     price_info = get_best_price(conn, product_cd, primary_source)
 
     if price_info["price_status"] == "ok":
         if price_info["used_source"] == primary_source:
-            memo = f"OK / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}"
+            memo = f"OK / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}{sim_note}"
         else:
-            memo = f"代替参照 / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}"
+            memo = f"代替参照 / 品番CD:{product_cd} / 参照DB:{price_info['used_source']}{sim_note}"
 
         return {
             "price_result": price_info["price_result"],
@@ -310,7 +315,7 @@ def auto_result_from_cd(conn: sqlite3.Connection, primary_source: str, product_c
 
     return {
         "price_result": "価格未入力",
-        "memo": f"品番CD:{product_cd} / 対象DBに価格なし",
+        "memo": f"品番CD:{product_cd} / 対象DBに価格なし{sim_note}",
         "product_cd": product_cd,
         "official_name": official_name,
         "unit": price_info["unit"],
@@ -376,10 +381,16 @@ def lookup_one(conn: sqlite3.Connection, primary_source: str, product_name: str)
         }
 
     # 選択DBの優先順で絞り込み、価格のある候補のみ表示
+    # 類似一致は高スコア(>=0.85)のときだけ自動確定し、それ以外は1件でも候補確認を出す
+    # （低スコアの名称を無確認で採用すると誤った価格が紛れ込むため）
+    AUTO_SIMILAR_THRESHOLD = 0.85
     for source in make_source_order(primary_source):
         in_source = get_candidates_in_source(conn, similar, source)
         if len(in_source) == 1:
-            return auto_result_from_cd(conn, primary_source, in_source[0]["product_cd"], in_source[0]["official_name"])
+            c = in_source[0]
+            if c["score"] >= AUTO_SIMILAR_THRESHOLD:
+                return auto_result_from_cd(conn, primary_source, c["product_cd"], c["official_name"], match_score=c["score"])
+            return selection_result(conn, primary_source, in_source, "似た候補が1件あります。内容を確認して選んでください。")
         elif len(in_source) >= 2:
             return selection_result(conn, primary_source, in_source, "似た候補があります。候補から選んでください。")
 
